@@ -12,8 +12,11 @@ st.set_page_config(page_title="스타일링홈 실시간 지휘소", layout="wid
 def get_gs_client():
     # Secrets에서 정보 로드
     creds_dict = dict(st.secrets["gcp_service_account"])
-    # 핵심: private_key 내의 줄바꿈(\n)을 파이썬이 이해할 수 있게 변환
-    creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+    
+    # [핵심] Invalid JWT Signature 에러 방지를 위한 줄바꿈 교정 로직
+    pk = creds_dict["private_key"]
+    if "\\n" in pk:
+        creds_dict["private_key"] = pk.replace("\\n", "\n")
     
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -28,22 +31,26 @@ try:
     task_ws = doc.worksheet("Task_Log")
 except Exception as e:
     st.error(f"🚨 연결 실패! 에러 내용: {e}")
+    st.info("💡 해결방법: 스트림릿 Secrets 칸의 [gcp_service_account] 설정이 정확한지 다시 확인해 보세요.")
     st.stop()
 
 # 상품 별칭 설정
 CODE_NAME_MAP = {"169814": "오늘의집 메이든 쉐이드", "382503180": "네이버 듀오"}
 
-# 데이터 실시간 로드
+# 데이터 실시간 로드 함수
 def fetch_data():
     try:
+        # 매출 데이터
         r = pd.DataFrame(raw_ws.get_all_records())
         if not r.empty:
             r['매출'] = pd.to_numeric(r['결제금액'].astype(str).str.replace(',', ''), errors='coerce').fillna(0) + \
                      pd.to_numeric(r['배송비'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
         
+        # 목표 데이터
         g = pd.DataFrame(goal_ws.get_all_records())
         g_dict = {str(row['code']): row['goal'] for _, row in g.iterrows()}
         
+        # 업무 리스트 데이터
         t = pd.DataFrame(task_ws.get_all_records())
         if t.empty:
             t = pd.DataFrame(columns=["할일", "상태", "등록일", "비고"])
@@ -56,7 +63,7 @@ df_raw, dict_goals, df_task = fetch_data()
 # ---------------------------------------------------------
 # UI 구성
 # ---------------------------------------------------------
-st.title("📊 스타일링홈 실시간 통합 지휘소 v3.7")
+st.title("📊 스타일링홈 실시간 통합 지휘소 v3.8")
 tab1, tab2, tab3 = st.tabs(["💰 매출 현황", "🎯 목표 영구 관리", "📝 업무 체크리스트"])
 
 # --- 탭 1: 매출 현황 ---
@@ -64,6 +71,8 @@ with tab1:
     if not df_raw.empty:
         st.metric("총 매출(배송비포함)", f"{df_raw['매출'].sum():,.0f}원")
         st.dataframe(df_raw[['주문일자', '쇼핑몰', '매입처', '매출']], use_container_width=True)
+    else:
+        st.warning("매출 데이터를 불러올 수 없습니다.")
 
 # --- 탭 2: 다중 목표 관리 (입력창 콤마 + 영구 저장) ---
 with tab2:
@@ -81,7 +90,10 @@ with tab2:
             # 입력창에 콤마가 찍힌 상태로 표시
             goal_str = st.text_input(f"{name} 목표 입력", value=f"{int(saved_goal):,}", key=f"goal_{code}")
             # 숫자만 추출
-            clean_num = int(re.sub(r'[^0-9]', '', goal_str)) if goal_str else 0
+            try:
+                clean_num = int(re.sub(r'[^0-9]', '', goal_str))
+            except:
+                clean_num = 0
             
             if st.button("시트에 영구 저장", key=f"btn_{code}"):
                 cell = goal_ws.find(code)
