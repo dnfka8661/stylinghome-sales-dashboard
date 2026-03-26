@@ -13,10 +13,10 @@ def get_gs_client():
     # Secrets에서 정보 로드
     creds_dict = dict(st.secrets["gcp_service_account"])
     
-    # [핵심] Invalid JWT Signature 에러 방지를 위한 줄바꿈 교정 로직
+    # [필살기] Invalid JWT Signature 에러의 99%는 여기서 잡힙니다.
+    # 텍스트로 들어온 \n 글자를 진짜 '줄바꿈' 신호로 바꿔주는 작업입니다.
     pk = creds_dict["private_key"]
-    if "\\n" in pk:
-        creds_dict["private_key"] = pk.replace("\\n", "\n")
+    creds_dict["private_key"] = pk.replace("\\n", "\n")
     
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -26,12 +26,13 @@ try:
     client = get_gs_client()
     doc = client.open_by_key("1gKfciaxjNwDRr-59fpS_fnn2N-Ef_ksqy5OKGco12_Y")
     
+    # 워크시트 연결 (이름 확인 필수!)
     raw_ws = doc.get_worksheet(0)
     goal_ws = doc.worksheet("Goal_Settings")
     task_ws = doc.worksheet("Task_Log")
 except Exception as e:
     st.error(f"🚨 연결 실패! 에러 내용: {e}")
-    st.info("💡 해결방법: 스트림릿 Secrets 칸의 [gcp_service_account] 설정이 정확한지 다시 확인해 보세요.")
+    st.info("💡 해결방법: Secrets 칸에 [gcp_service_account]를 그대로 복사했는지 다시 봐주세요!")
     st.stop()
 
 # 상품 별칭 설정
@@ -50,7 +51,7 @@ def fetch_data():
         g = pd.DataFrame(goal_ws.get_all_records())
         g_dict = {str(row['code']): row['goal'] for _, row in g.iterrows()}
         
-        # 업무 리스트 데이터
+        # 업무 리스트 데이터 (없으면 틀 생성)
         t = pd.DataFrame(task_ws.get_all_records())
         if t.empty:
             t = pd.DataFrame(columns=["할일", "상태", "등록일", "비고"])
@@ -72,9 +73,9 @@ with tab1:
         st.metric("총 매출(배송비포함)", f"{df_raw['매출'].sum():,.0f}원")
         st.dataframe(df_raw[['주문일자', '쇼핑몰', '매입처', '매출']], use_container_width=True)
     else:
-        st.warning("매출 데이터를 불러올 수 없습니다.")
+        st.warning("데이터를 불러올 수 없습니다. Raw 시트를 확인하세요.")
 
-# --- 탭 2: 다중 목표 관리 (입력창 콤마 + 영구 저장) ---
+# --- 탭 2: 다중 목표 관리 (콤마 입력 + 시트 저장) ---
 with tab2:
     st.header("🎯 주력 상품 목표 관리")
     selected = st.multiselect("분석할 상품 선택", list(CODE_NAME_MAP.keys()), 
@@ -87,19 +88,18 @@ with tab2:
         with col1:
             st.subheader(name)
         with col2:
-            # 입력창에 콤마가 찍힌 상태로 표시
-            goal_str = st.text_input(f"{name} 목표 입력", value=f"{int(saved_goal):,}", key=f"goal_{code}")
-            # 숫자만 추출
+            # 콤마 포함 입력창
+            goal_str = st.text_input(f"{name} 목표", value=f"{int(saved_goal):,}", key=f"goal_{code}")
             try:
                 clean_num = int(re.sub(r'[^0-9]', '', goal_str))
             except:
                 clean_num = 0
             
-            if st.button("시트에 영구 저장", key=f"btn_{code}"):
+            if st.button("시트에 저장", key=f"btn_{code}"):
                 cell = goal_ws.find(code)
                 if cell: goal_ws.update_cell(cell.row, 2, clean_num)
                 else: goal_ws.append_row([code, clean_num])
-                st.success(f"{name} 저장 성공!")
+                st.success(f"{name} 저장 완료!")
                 st.rerun()
         with col3:
             actual = df_raw[df_raw['쇼핑몰 상품코드'].astype(str) == code]['매출'].sum() if not df_raw.empty else 0
