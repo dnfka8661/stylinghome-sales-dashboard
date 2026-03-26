@@ -1,18 +1,18 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 import re
 
 # 1. 페이지 설정
 st.set_page_config(page_title="스타일링홈 실시간 지휘소", layout="wide")
 
-# 2. 구글 시트 정보 (에러 방지를 위해 CSV 내보내기 방식 사용)
+# 2. 구글 시트 정보
 SHEET_ID = "1gKfciaxjNwDRr-59fpS_fnn2N-Ef_ksqy5OKGco12_Y"
 RAW_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid=0"
 GOAL_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid=1052062562"
 TASK_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid=462337466"
 
-# 상품 별칭 (원하시는 이름을 여기에 계속 추가하세요)
+# 상품 별칭
 CODE_NAME_MAP = {
     "169814": "오늘의집 메이든 쉐이드",
     "382503180": "네이버 듀오",
@@ -22,6 +22,7 @@ CODE_NAME_MAP = {
 def load_data(url):
     try:
         df = pd.read_csv(url)
+        # 컬럼명 앞뒤 공백 제거 (KeyError 방지)
         df.columns = [str(c).strip() for c in df.columns]
         return df
     except:
@@ -32,23 +33,43 @@ raw_df = load_data(RAW_URL)
 goal_df = load_data(GOAL_URL)
 task_df = load_data(TASK_URL)
 
+# ---------------------------------------------------------
+# [중요] 데이터 전처리 (에러 발생 원인 해결 지점)
+# ---------------------------------------------------------
+if not raw_df.empty:
+    # 1. 상품코드를 문자열로 변환 (미리 해둠)
+    if '쇼핑몰 상품코드' in raw_df.columns:
+        raw_df['상품코드_str'] = raw_df['쇼핑몰 상품코드'].astype(str).str.strip()
+    else:
+        raw_df['상품코드_str'] = ""
+
+    # 2. [해결!] 원본 데이터(raw_df)에 '매출' 컬럼을 먼저 생성합니다.
+    # 결제금액과 배송비를 합쳐서 '매출' 계산
+    for col in ['결제금액', '배송비']:
+        if col in raw_df.columns:
+            raw_df[col] = pd.to_numeric(raw_df[col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+        else:
+            raw_df[col] = 0
+            
+    raw_df['매출'] = raw_df['결제금액'] + raw_df['배송비']
+
+    # 3. 날짜 변환
+    raw_df['주문일_dt'] = pd.to_datetime(raw_df['주문일자'], errors='coerce')
+
 # --- [사이드바 필터 영역] ---
 st.sidebar.header("🔍 검색 필터")
 
 if not raw_df.empty:
-    # 1. 날짜 필터 (주문일자 기준)
-    raw_df['주문일_dt'] = pd.to_datetime(raw_df['주문일자'], errors='coerce')
+    # 1. 날짜 필터
     min_date = raw_df['주문일_dt'].min().date() if not raw_df['주문일_dt'].isnull().all() else datetime.now().date()
     max_date = raw_df['주문일_dt'].max().date() if not raw_df['주문일_dt'].isnull().all() else datetime.now().date()
-    
     date_range = st.sidebar.date_input("🗓️ 분석 기간 선택", [min_date, max_date])
     
     # 2. 쇼핑몰 필터
-    all_malls = sorted(raw_df['쇼핑몰'].unique().tolist())
+    all_malls = sorted(raw_df['쇼핑몰'].unique().tolist()) if '쇼핑몰' in raw_df.columns else []
     selected_malls = st.sidebar.multiselect("🛒 쇼핑몰 선택", all_malls, default=all_malls)
     
     # 3. 상품코드 필터
-    raw_df['상품코드_str'] = raw_df['쇼핑몰 상품코드'].astype(str)
     all_codes = sorted(raw_df['상품코드_str'].unique().tolist())
     code_display = [f"{c} | {CODE_NAME_MAP.get(c, '미등록')}" for c in all_codes]
     selected_items = st.sidebar.multiselect("📦 상품코드 선택", code_display, default=code_display[:5] if len(code_display) > 5 else code_display)
@@ -61,15 +82,11 @@ if not raw_df.empty:
         mask = mask & (raw_df['주문일_dt'].dt.date >= date_range[0]) & (raw_df['주문일_dt'].dt.date <= date_range[1])
     
     filtered_df = raw_df[mask].copy()
-    
-    # 매출 계산
-    filtered_df['매출'] = pd.to_numeric(filtered_df['결제금액'].astype(str).str.replace(',', ''), errors='coerce').fillna(0) + \
-                         pd.to_numeric(filtered_df['배송비'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
 
 # ---------------------------------------------------------
 # 메인 UI 레이아웃
 # ---------------------------------------------------------
-st.title("📊 스타일링홈 통합 매출 지휘소 v5.5")
+st.title("📊 스타일링홈 통합 매출 지휘소 v5.6")
 t1, t2, t3 = st.tabs(["💰 실시간 매출 현황", "🎯 다중 목표 관리", "📝 업무 체크리스트"])
 
 with t1:
@@ -81,7 +98,10 @@ with t1:
         
         st.divider()
         st.subheader("🏢 필터링된 실적 현황")
-        st.dataframe(filtered_df[['주문일자', '쇼핑몰', '매입처', '매출']], use_container_width=True, hide_index=True)
+        display_cols = ['주문일자', '쇼핑몰', '매출']
+        # 컬럼이 존재하는지 확인 후 출력
+        actual_display = [c for c in display_cols if c in filtered_df.columns]
+        st.dataframe(filtered_df[actual_display], use_container_width=True, hide_index=True)
     else:
         st.error("데이터 로드 실패")
 
@@ -89,25 +109,34 @@ with t2:
     st.header("🎯 주력 상품 목표 관리")
     st.caption("※ 기간 필터와 상관없이 상품별 누적 실적을 보여줍니다.")
     
-    goal_dict = {str(row['code']): row['goal'] for _, row in goal_df.iterrows()} if not goal_df.empty else {}
-    
-    # 사이드바에서 선택된 상품들만 루프 돌림
-    for item in selected_items:
-        code = item.split(" | ")[0].strip()
-        name = CODE_NAME_MAP.get(code, f"상품 {code}")
+    if not raw_df.empty:
+        # goal_df에서 목표값 가져오기
+        if not goal_df.empty and 'code' in goal_df.columns and 'goal' in goal_df.columns:
+            goal_dict = {str(row['code']).strip(): row['goal'] for _, row in goal_df.iterrows()}
+        else:
+            goal_dict = {}
         
-        target = goal_dict.get(code, 10000000)
-        actual = raw_df[raw_df['상품코드_str'] == code]['매출'].sum()
-        achievement = (actual / target * 100) if target > 0 else 0
-        
-        col_info, col_bar = st.columns([3, 7])
-        with col_info:
-            st.markdown(f"### {name}")
-            st.write(f"목표: {target:,.0f}원 / 현재: **{actual:,.0f}원**")
-        with col_bar:
-            st.write(f"달성률: **{achievement:.1f}%**")
-            st.progress(min(achievement/100, 1.0))
-        st.write("---")
+        for item in selected_items:
+            code = item.split(" | ")[0].strip()
+            name = CODE_NAME_MAP.get(code, f"상품 {code}")
+            
+            # 목표값이 없으면 기본 1,000만 원 설정
+            target = float(goal_dict.get(code, 10000000))
+            
+            # 이제 raw_df에 '매출' 컬럼이 확실히 있으므로 에러가 나지 않습니다!
+            actual = raw_df[raw_df['상품코드_str'] == code]['매출'].sum()
+            achievement = (actual / target * 100) if target > 0 else 0
+            
+            col_info, col_bar = st.columns([3, 7])
+            with col_info:
+                st.markdown(f"### {name}")
+                st.write(f"목표: {target:,.0f}원 / 현재: **{actual:,.0f}원**")
+            with col_bar:
+                st.write(f"달성률: **{achievement:.1f}%**")
+                st.progress(min(achievement/100, 1.0))
+            st.write("---")
+    else:
+        st.info("데이터가 없습니다.")
 
 with t3:
     st.header("📝 업무 체크리스트")
