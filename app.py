@@ -1,147 +1,98 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-from datetime import datetime, date
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import re
 
 # 1. 페이지 설정
 st.set_page_config(page_title="스타일링홈 매출 분석 시스템", layout="wide")
 
-# 2. 구글 시트 연결 정보
-SHEET_ID = "1gKfciaxjNwDRr-59fpS_fnn2N-Ef_ksqy5OKGco12_Y"
-BASE_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
-RAW_URL = f"{BASE_URL}&gid=0"
-TASK_URL = f"{BASE_URL}&gid=462337466"
+# 2. 구글 시트 보안 연결
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+try:
+    creds = ServiceAccountCredentials.from_json_keyfile_name("key.json", scope)
+    client = gspread.authorize(creds)
+    doc = client.open_by_key("1gKfciaxjNwDRr-59fpS_fnn2N-Ef_ksqy5OKGco12_Y")
+    
+    raw_ws = doc.get_worksheet(0)
+    goal_ws = doc.worksheet("Goal_Settings")
+    task_ws = doc.worksheet("Task_Log")
+except Exception as e:
+    st.error(f"⚠️ 연결 실패: key.json 파일이 없거나 탭 이름이 'Goal_Settings', 'Task_Log'가 아닙니다. ({e})")
+    st.stop()
 
-# [핵심] 상품코드별 명칭 매핑 사전
-CODE_NAME_MAP = {
-    "169814": "오늘의집 메이든 쉐이드",
-    "382503180": "네이버 듀오"
-}
+# 상품 별칭 설정
+CODE_NAME_MAP = {"169814": "오늘의집 메이든 쉐이드", "382503180": "네이버 듀오"}
 
-@st.cache_data
-def load_all_data():
-    try:
-        raw = pd.read_csv(RAW_URL)
-        task = pd.read_csv(TASK_URL)
-        for d in [raw, task]:
-            d.columns = [str(c).strip() for c in d.columns]
-            
-        def auto_map(df, keywords, default_name):
-            for k in keywords:
-                for c in df.columns:
-                    if k in c: return df.rename(columns={c: default_name})
-            if default_name not in df.columns:
-                df[default_name] = 0 if any(x in default_name for x in ["금액", "수량", "배송비"]) else ""
-            return df
+# 데이터 불러오기
+def fetch_all():
+    raw = pd.DataFrame(raw_ws.get_all_records())
+    if not raw.empty:
+        raw['매출'] = pd.to_numeric(raw['결제금액'].astype(str).str.replace(',', ''), errors='coerce').fillna(0) + \
+                     pd.to_numeric(raw['배송비'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+    
+    goals = pd.DataFrame(goal_ws.get_all_records())
+    goal_dict = {str(r['code']): r['goal'] for _, r in goals.iterrows()} if not goals.empty else {}
+    
+    tasks = pd.DataFrame(task_ws.get_all_records())
+    if tasks.empty:
+        tasks = pd.DataFrame(columns=["할일", "상태", "비고"])
+    return raw, goal_dict, tasks
 
-        raw = auto_map(raw, ['주문일자', '주문일'], '표준_주문일')
-        raw = auto_map(raw, ['결제금액', '매출'], '표준_결제금액')
-        raw = auto_map(raw, ['EAx수량', '판매수량', '수량'], '표준_판매수량')
-        raw = auto_map(raw, ['배송비'], '표준_배송비')
-        raw = auto_map(raw, ['쇼핑몰 상품코드', '상품코드'], '표준_상품코드')
-        raw = auto_map(raw, ['쇼핑몰', '판매처'], '표준_쇼핑몰')
-        raw = auto_map(raw, ['매입처'], '표준_매입처')
-        raw = auto_map(raw, ['상품약어', '품명'], '표준_상품약어')
+df_raw, dict_goals, df_task = fetch_all()
 
-        raw['표준_주문일'] = pd.to_datetime(raw['표준_주문일'], errors='coerce').dt.date
-        raw = raw.dropna(subset=['표준_주문일'])
-        for c in ['표준_결제금액', '표준_판매수량', '표준_배송비']:
-            raw[c] = pd.to_numeric(raw[c].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-        raw['표준_총매출액'] = raw['표준_결제금액'] + raw['표준_배송비']
-        return raw, task
-    except Exception as e:
-        st.error(f"데이터 로드 중 오류: {e}")
-        return pd.DataFrame(), pd.DataFrame()
+# ---------------------------------------------------------
+# 메인 화면
+# ---------------------------------------------------------
+st.title("🚀 스타일링홈 실시간 지휘소 3.2")
+t1, t2, t3 = st.tabs(["💰 매출", "🎯 목표 관리", "📝 업무 체크리스트"])
 
-df_raw, df_task = load_all_data()
+with t1:
+    if not df_raw.empty:
+        st.metric("총 매출(배송비포함)", f"{df_raw['매출'].sum():,.0f}원")
+        st.dataframe(df_raw[['주문일자', '쇼핑몰', '매입처', '매출']], use_container_width=True)
 
-# --- 사이드바 및 기본 필터 ---
-if not df_raw.empty:
-    st.sidebar.header("🔍 데이터 통합 필터")
-    min_d, max_d = df_raw['표준_주문일'].min(), df_raw['표준_주문일'].max()
-    date_range = st.sidebar.date_input("조회 기간 설정", [min_d, max_d])
-    shops = ["전체"] + sorted(df_raw['표준_쇼핑몰'].unique().tolist())
-    sel_shops = st.sidebar.multiselect("판매처 선택", shops, default="전체")
-
-    df_f = df_raw.copy()
-    if len(date_range) == 2:
-        df_f = df_f[(df_f['표준_주문일'] >= date_range[0]) & (df_f['표준_주문일'] <= date_range[1])]
-    if "전체" not in sel_shops and sel_shops:
-        df_f = df_f[df_f['표준_쇼핑몰'].isin(sel_shops)]
-
-    st.title("📊 스타일링홈 매출 분석 지휘소 2.0")
-    t1, t2, t3 = st.tabs(["💰 실시간 매출 현황", "🎯 다중 목표 관리", "📝 업무 체크리스트"])
-
-    with t1:
-        # 기존 매출 현황 레이아웃 (매입처, 쇼핑몰, 상품약어 순위)
-        c_m1, c_m2, c_m3 = st.columns(3)
-        c_m1.metric("총 매출액(배송비포함)", f"{df_f['표준_총매출액'].sum():,.0f}원")
-        c_m2.metric("총 판매수량", f"{int(df_f['표준_판매수량'].sum()):,}개")
-        c_m3.metric("주문 건수", f"{len(df_f):,}건")
-        st.divider()
-        col_vendor, col_shop = st.columns(2)
-        with col_vendor:
-            st.subheader("🏢 매입처별 실적")
-            v_df = df_f.groupby('표준_매입처')['표준_총매출액'].sum().sort_values(ascending=False).reset_index()
-            st.dataframe(v_df, use_container_width=True, hide_index=True)
-        with col_shop:
-            st.subheader("🛒 쇼핑몰별 실적")
-            s_df = df_f.groupby('표준_쇼핑몰')['표준_총매출액'].sum().sort_values(ascending=False).reset_index()
-            st.dataframe(s_df, use_container_width=True, hide_index=True)
-        st.divider()
-        st.subheader("📦 상품약어별 판매 수량")
-        p_df = df_f.groupby('표준_상품약어')['표준_판매수량'].sum().sort_values(ascending=False).reset_index()
-        st.dataframe(p_df, use_container_width=True, hide_index=True)
-
-    with t2:
-        st.header("🎯 주력 상품군 집중 목표 관리")
+with t2:
+    st.header("🎯 주력 상품 목표 관리")
+    selected_codes = st.multiselect("분석할 상품 선택", list(CODE_NAME_MAP.keys()), 
+                                    format_func=lambda x: f"{x} | {CODE_NAME_MAP[x]}")
+    
+    for code in selected_codes:
+        alias = CODE_NAME_MAP[code]
+        saved_goal = dict_goals.get(code, 10000000)
         
-        # 상품코드 리스트 준비 (별칭 포함)
-        all_raw_codes = sorted(df_raw['표준_상품코드'].unique().astype(str).tolist())
-        display_options = []
-        for code in all_raw_codes:
-            alias = CODE_NAME_MAP.get(code, "")
-            display_text = f"{code} | {alias}" if alias else code
-            display_options.append(display_text)
-
-        selected_display = st.multiselect("관리할 상품을 선택하세요", display_options, default=display_options[:1])
-        st.divider()
-
-        if selected_display:
-            for display_item in selected_display:
-                # 선택된 텍스트에서 코드만 다시 추출
-                current_code = display_item.split(" | ")[0].strip()
-                custom_name = CODE_NAME_MAP.get(current_code, "")
+        with st.container():
+            col_info, col_input, col_bar = st.columns([2, 3, 5])
+            with col_info:
+                st.subheader(alias)
+            with col_input:
+                # [해결] 입력창에 콤마가 찍힌 상태로 로드 (text_input 활용)
+                goal_str = st.text_input(f"{alias} 목표 입력", value=f"{int(saved_goal):,}", key=f"in_{code}")
+                # 콤마 제거 후 숫자로 변환
+                try:
+                    goal_num = int(re.sub(r'[^0-9]', '', goal_str))
+                except:
+                    goal_num = 0
                 
-                with st.container():
-                    col_info, col_input, col_bar = st.columns([2.5, 2, 4.5])
-                    
-                    with col_info:
-                        if custom_name:
-                            st.subheader(custom_name)
-                            st.caption(f"상품코드: {current_code}")
-                        else:
-                            # 별칭이 없는 경우 기존처럼 상품약어를 가져옴
-                            p_name = df_raw[df_raw['표준_상품코드'].astype(str) == current_code]['표준_상품약어'].iloc[0]
-                            st.write(f"**[{current_code}]**")
-                            st.caption(p_name)
-                    
-                    with col_input:
-                        p_goal = st.number_input(f"목표(원)", value=10000000, step=1000000, key=f"goal_{current_code}")
-                    
-                    with col_bar:
-                        if len(date_range) == 2:
-                            p_actual = df_f[df_f['표준_상품코드'].astype(str) == current_code]['표준_총매출액'].sum()
-                            p_rate = (p_actual / p_goal * 100) if p_goal > 0 else 0
-                            st.write(f"기간 매출: **{p_actual:,.0f}원** (달성률: {p_rate:.1f}%)")
-                            st.progress(min(p_rate/100, 1.0))
-                st.write("") 
-        else:
-            st.info("조회할 상품을 선택해 주세요.")
+                if st.button(f"시트에 저장", key=f"save_{code}"):
+                    cell = goal_ws.find(code)
+                    if cell: goal_ws.update_cell(cell.row, 2, goal_num)
+                    else: goal_ws.append_row([code, goal_num])
+                    st.success("저장 성공!")
+                    st.rerun()
+            with col_bar:
+                actual = df_raw[df_raw['쇼핑몰 상품코드'].astype(str) == code]['매출'].sum() if not df_raw.empty else 0
+                rate = (actual / goal_num * 100) if goal_num > 0 else 0
+                st.write(f"현재: {actual:,.0f}원 / 달성률: {rate:.1f}%")
+                st.progress(min(rate/100, 1.0))
 
-    with t3:
-        st.subheader("📋 실시간 업무 현황")
-        st.dataframe(df_task, use_container_width=True, hide_index=True)
-
-else:
-    st.warning("데이터를 불러올 수 없습니다.")
+with t3:
+    st.header("📝 업무 체크리스트 편집")
+    st.info("수정 후 아래 '저장' 버튼을 눌러야 시트에 반영됩니다.")
+    # [해결] 엑셀처럼 직접 편집하는 창
+    edited_task = st.data_editor(df_task, num_rows="dynamic", use_container_width=True, key="task_edit")
+    
+    if st.button("💾 시트에 최종 저장"):
+        task_ws.clear()
+        task_ws.update([edited_task.columns.values.tolist()] + edited_task.fillna("").values.tolist())
+        st.success("시트 업데이트 완료!")
